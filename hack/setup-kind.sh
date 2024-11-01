@@ -33,10 +33,9 @@ do
 done
 
 # Defaults
-K8S_VERSION="v1.24.x"
-KNATIVE_VERSION="1.6.0"
+K8S_VERSION="v1.29.x"
 REGISTRY_NAME="registry.local"
-REGISTRY_PORT="5000"
+REGISTRY_PORT="5001"
 CLUSTER_SUFFIX="cluster.local"
 
 while [[ $# -ne 0 ]]; do
@@ -48,7 +47,7 @@ while [[ $# -ne 0 ]]; do
       ;;
     --knative-version)
       shift
-      KNATIVE_VERSION="$1"
+      KNATIVE_VERSION_ARG="$1"
       ;;
     --registry-url)
       shift
@@ -65,25 +64,38 @@ while [[ $# -ne 0 ]]; do
 done
 
 # The version map correlated with this version of KinD
-KIND_VERSION="v0.15.0"
+# KNATIVE versions are set from https://github.com/knative/community/blob/main/mechanics/RELEASE-SCHEDULE.md
+KIND_VERSION="v0.22.0"
 case ${K8S_VERSION} in
-  v1.23.x)
-    K8S_VERSION="1.23.10"
-    KIND_IMAGE_SHA="sha256:f047448af6a656fae7bc909e2fab360c18c487ef3edc93f06d78cdfd864b2d12"
-    KIND_IMAGE="kindest/node:v${K8S_VERSION}@${KIND_IMAGE_SHA}"
-    ;;
-  v1.24.x)
-    K8S_VERSION="1.24.4"
-    KIND_IMAGE_SHA="sha256:adfaebada924a26c2c9308edd53c6e33b3d4e453782c0063dc0028bdebaddf98"
+  v1.27.x)
+    K8S_VERSION="1.27.11"
+    KNATIVE_VERSION="1.12.0"
+    KIND_IMAGE_SHA="sha256:681253009e68069b8e01aad36a1e0fa8cf18bb0ab3e5c4069b2e65cafdd70843"
     KIND_IMAGE=kindest/node:${K8S_VERSION}@${KIND_IMAGE_SHA}
     ;;
-  v1.25.x)
-    K8S_VERSION="1.25.0"
-    KIND_IMAGE_SHA="sha256:428aaa17ec82ccde0131cb2d1ca6547d13cf5fdabcc0bbecf749baa935387cbf"
+  v1.28.x)
+    K8S_VERSION="1.28.7"
+    KNATIVE_VERSION="1.12.0"
+    KIND_IMAGE_SHA="sha256:9bc6c451a289cf96ad0bbaf33d416901de6fd632415b076ab05f5fa7e4f65c58"
+    KIND_IMAGE=kindest/node:${K8S_VERSION}@${KIND_IMAGE_SHA}
+    ;;
+  v1.29.x)
+    K8S_VERSION="1.29.2"
+    KNATIVE_VERSION="1.12.0"
+    KIND_IMAGE_SHA="sha256:51a1434a5397193442f0be2a297b488b6c919ce8a3931be0ce822606ea5ca245"
+    KIND_IMAGE=kindest/node:${K8S_VERSION}@${KIND_IMAGE_SHA}
+    ;;
+  v1.30.x)
+    K8S_VERSION="1.30.0"
+    KNATIVE_VERSION="1.12.0"
+    KIND_IMAGE_SHA="sha256:047357ac0cfea04663786a612ba1eaba9702bef25227a794b52890dd8bcd692e"
     KIND_IMAGE=kindest/node:${K8S_VERSION}@${KIND_IMAGE_SHA}
     ;;
   *) echo "Unsupported version: ${K8S_VERSION}"; exit 1 ;;
 esac
+
+# allow cmd line arg to explicitly override knative mapping above
+KNATIVE_VERSION=${KNATIVE_VERSION_ARG:=${KNATIVE_VERSION}}
 
 #############################################################
 #
@@ -159,7 +171,7 @@ kubeadmConfigPatches:
       name: config
     apiServer:
       extraArgs:
-        "service-account-issuer": "https://kubernetes.default.svc"
+        "service-account-issuer": "https://kubernetes.default.svc.cluster.local"
         "service-account-key-file": "/etc/kubernetes/pki/sa.pub"
         "service-account-signing-key-file": "/etc/kubernetes/pki/sa.key"
         "service-account-api-audiences": "api,spire-server"
@@ -197,9 +209,9 @@ echo '::endgroup::'
 #    Setup metallb
 #
 #############################################################
-echo '::group:: Setup metallb'
+echo '::group:: Setup metallb 0.14.5'
 
-kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/v0.13.5/config/manifests/metallb-native.yaml
+kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/v0.14.5/config/manifests/metallb-native.yaml
 kubectl create secret generic -n metallb-system memberlist --from-literal=secretkey="$(openssl rand -base64 128)"
 
 # Wait for Metallb to be ready (or webhook will reject CRDs)
@@ -210,7 +222,7 @@ done
 # And allow for few seconds for things to settle just to make sure things are up
 sleep 5
 
-network=$(docker network inspect kind -f "{{(index .IPAM.Config 0).Subnet}}" | cut -d '.' -f1,2)
+network=$(docker network inspect kind |jq -r '.[0].subnets[1].subnet')
 cat <<EOF >>./metallb-crds.yaml
 apiVersion: metallb.io/v1beta1
 kind: IPAddressPool
@@ -253,8 +265,11 @@ echo '::endgroup::'
 echo '::group:: Setup container registry'
 
 
-docker run -d --restart=always \
-       -p "$REGISTRY_PORT:$REGISTRY_PORT" --name "$REGISTRY_NAME" registry:2
+if [ "$(docker inspect -f '{{.State.Running}}' "${REGISTRY_NAME}" 2>/dev/null || true)" != 'true' ]; then
+  docker run \
+    -d --restart=always -p "127.0.0.1:${REGISTRY_PORT}:${REGISTRY_PORT}" --name "${REGISTRY_NAME}" \
+    -e REGISTRY_HTTP_ADDR="0.0.0.0:${REGISTRY_PORT}" registry:2
+fi
 
 # Connect the registry to the KinD network.
 docker network connect "kind" "$REGISTRY_NAME"
@@ -298,7 +313,7 @@ function resource_blaster() {
 }
 
 resource_blaster serving serving-crds.yaml | kubectl apply -f -
-sleep 3 # Avoid the race creating CRDs then instantiating them...
+sleep 10 # Avoid the race creating CRDs then instantiating them...
 resource_blaster serving serving-core.yaml | kubectl apply -f -
 resource_blaster net-kourier kourier.yaml | kubectl apply -f -
 kubectl patch configmap/config-network \
